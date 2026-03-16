@@ -1,9 +1,10 @@
 import streamlit as st
-import psycopg2
 import pandas as pd
 from datetime import date
 
+# Disable remote PostgreSQL and use local built-in tariff values for fast demo.
 DATABASE_URL = "postgresql://postgres.shabbrpajsspqwcjdhgx:TMeCzgKhztrEJCln@aws-1-eu-west-1.pooler.supabase.com:5432/postgres"
+DATABASE_ENABLED = False  # set to True if you have a reliable DB connection
 
 FALLBACK_YEAR_LIST = [2025, 2024, 2023]
 FALLBACK_PERIODS = {
@@ -23,9 +24,13 @@ FALLBACK_SERVICE_CHARGE = {
 LEVY_RATE = 0.05  # 5% levies and taxes on energy charge
 
 def get_connection():
+    if not DATABASE_ENABLED:
+        return None
+
     try:
+        import psycopg2
         return psycopg2.connect(DATABASE_URL)
-    except Exception as e:
+    except Exception:
         st.warning("DB connection failed; using local fallback data.")
         return None
 
@@ -136,18 +141,39 @@ def calculate_energy_bill(consumption, blocks):
 
     return total
 
-def estimate_consumption_from_bill(bill, blocks, service_charge):
-    """Estimate consumption from bill amount."""
-    bill = float(bill) - float(service_charge)
 
-    if bill <= 0:
+def calculate_statutory_charges(energy_charge, service_charge, category_name):
+    """Calculate levies and tax depending on category."""
+    levy = energy_charge * 0.05
+    if category_name == "Residential":
+        tax = 0.0
+    else:
+        tax = 0.20 * (energy_charge + service_charge)
+
+    return levy, tax
+
+
+def estimate_consumption_from_bill(bill, blocks, service_charge, category_name):
+    """Estimate consumption from bill amount using category-specific statutory structure."""
+    bill = float(bill)
+    sc = float(service_charge)
+
+    if category_name == "Residential":
+        # Residential: B = E*1.05 + SC
+        if bill <= sc:
+            return 0
+        energy_budget = (bill - sc) / 1.05
+    else:
+        # Others: B = E*1.25 + SC*1.20
+        if bill <= sc * 1.2:
+            return 0
+        energy_budget = (bill - sc * 1.2) / 1.25
+
+    if energy_budget <= 0:
         return 0
 
-    # Remove levy/tax from bill
-    bill = bill / (1 + LEVY_RATE)
-
     consumption = 0
-    remaining_bill = bill
+    remaining_energy_cost = energy_budget
 
     for _, row in blocks.iterrows():
         start = row["block_start_kwh"]
@@ -155,17 +181,18 @@ def estimate_consumption_from_bill(bill, blocks, service_charge):
         rate = float(row["rate"])
 
         if end is None:
-            consumption += remaining_bill / rate
+            electric_energy = remaining_energy_cost / rate
+            consumption += electric_energy
             break
 
         block_units = end - start
         block_cost = block_units * rate
 
-        if remaining_bill > block_cost:
+        if remaining_energy_cost >= block_cost:
             consumption += block_units
-            remaining_bill -= block_cost
+            remaining_energy_cost -= block_cost
         else:
-            consumption += remaining_bill / rate
+            consumption += remaining_energy_cost / rate
             break
 
     return consumption
@@ -283,49 +310,59 @@ if st.button("🔍 Calculate", use_container_width=True):
     
     elif mode == "Consumption → Bill":
         energy_bill = calculate_energy_bill(consumption, blocks)
-        levy_tax = energy_bill * LEVY_RATE
-        total_bill = energy_bill + levy_tax + float(service_charge)
-        
+        levy, tax = calculate_statutory_charges(energy_bill, float(service_charge), category_name)
+        total_bill = energy_bill + levy + tax + float(service_charge)
+
         res_col1, res_col2, res_col3, res_col4 = st.columns(4)
-        
+
         with res_col1:
             st.metric("Consumption", f"{consumption:.2f} kWh")
         with res_col2:
             st.metric("Energy Charge", f"GHS {energy_bill:.2f}")
         with res_col3:
-            st.metric("Levies/Taxes (5%)", f"GHS {levy_tax:.2f}")
+            st.metric("Levies (5%)", f"GHS {levy:.2f}")
         with res_col4:
             st.metric("📊 Total Bill", f"GHS {total_bill:.2f}", delta=None)
-        
-        # Breakdown table
-        breakdown = pd.DataFrame({
-            "Component": ["Energy Charge", "Levies/Taxes", "Service Charge", "Total"],
-            "Amount (GHS)": [
-                f"{energy_bill:.2f}",
-                f"{levy_tax:.2f}",
-                f"{float(service_charge):.2f}",
-                f"{total_bill:.2f}"
-            ]
-        })
+
+        stat_rows = [
+            ("Energy Charge", energy_bill),
+            ("Levies (5%)", levy),
+            ("Service Charge", float(service_charge)),
+        ]
+        if tax > 0:
+            stat_rows.append(("Tax (20%)", tax))
+        stat_rows.append(("Total", total_bill))
+
+        breakdown = pd.DataFrame(stat_rows, columns=["Component", "Amount (GHS)"])
         st.dataframe(breakdown, use_container_width=True, hide_index=True)
     
     elif mode == "Bill → Consumption":
-        if bill_amount < float(service_charge):
-            st.error(f"⚠️ Bill amount must be at least GHS {float(service_charge):.2f} (service charge)")
+        if category_name == "Residential":
+            minimum_amount = float(service_charge)
         else:
-            consumption_est = estimate_consumption_from_bill(bill_amount, blocks, service_charge)
-            
+            minimum_amount = float(service_charge) * 1.20
+
+        if bill_amount < minimum_amount:
+            st.error(f"⚠️ Bill amount must be at least GHS {minimum_amount:.2f} for this category.")
+        else:
+            consumption_est = estimate_consumption_from_bill(bill_amount, blocks, service_charge, category_name)
+
             res_col1, res_col2, res_col3 = st.columns(3)
-            
+
             with res_col1:
                 st.metric("Bill Amount", f"GHS {bill_amount:.2f}")
             with res_col2:
                 st.metric("Service Charge", f"GHS {float(service_charge):.2f}")
             with res_col3:
                 st.metric("📊 Est. Consumption", f"{consumption_est:.2f} kWh")
-            
-            # Calculation breakdown
-            st.info(f"**Estimated consumption:** {consumption_est:.2f} kWh based on the provided bill amount and current tariff rates.")
+
+            st.info(
+                f"**Estimated consumption:** {consumption_est:.2f} kWh.\n"
+                f"This assumes totals use: Levies = 5% Energy, "
+                f"Tax = 20% of (Energy + Service Charge) for non-residential, "
+                f"and Residential only has levies + service charge."
+            )
+
 
 st.markdown("---")
 st.caption("💡 Tip: Use the sidebar to change modes and customer categories quickly.")
